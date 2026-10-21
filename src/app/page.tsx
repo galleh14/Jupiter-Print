@@ -26,6 +26,7 @@ type HargaApi = {
     harga_konsul?: number;
   };
   paket?: Record<string, unknown>[];
+  kebijakan?: string;
 };
 
 type PesananBerhasil = {
@@ -85,6 +86,8 @@ export default function Home() {
   >("memuat");
   const [paketList, setPaketList] = useState<Paket[]>([]);
   const [paketTerpilih, setPaketTerpilih] = useState<number | null>(null);
+  const [kebijakan, setKebijakan] = useState("");
+  const [setujuKebijakan, setSetujuKebijakan] = useState(false);
 
   const [nama, setNama] = useState("");
   const [noWa, setNoWa] = useState("");
@@ -176,6 +179,7 @@ export default function Home() {
           hargaKonsul,
         });
         setPaketList(paket);
+        setKebijakan(typeof data.kebijakan === "string" ? data.kebijakan : "");
         setSumberHarga("database");
 
         if (paket.length > 0) {
@@ -346,6 +350,7 @@ export default function Home() {
 
       setOrderSukses(data as PesananBerhasil);
       idempotencyKeyRef.current = null;
+      setSetujuKebijakan(false);
       setProgresUpload("");
     } catch (error) {
       setErrorPesanan(
@@ -756,6 +761,27 @@ export default function Home() {
                 </div>
               )}
 
+              {kebijakan.trim() && (
+                <div className="rounded-2xl border border-[#dfe6d9] bg-[#f8f9f3] p-4">
+                  <p className="whitespace-pre-line text-sm leading-6 text-[#647367]">
+                    {kebijakan}
+                  </p>
+                  <label className="mt-4 flex cursor-pointer items-start gap-3 text-sm font-semibold">
+                    <input
+                      type="checkbox"
+                      checked={setujuKebijakan}
+                      onChange={(event) =>
+                        setSetujuKebijakan(event.target.checked)
+                      }
+                      className="mt-1 h-4 w-4 accent-[#28543b]"
+                    />
+                    <span>
+                      Saya sudah membaca dan setuju dengan kebijakan di atas
+                    </span>
+                  </label>
+                </div>
+              )}
+
               <button
                 type="submit"
                 disabled={
@@ -764,7 +790,8 @@ export default function Home() {
                   dokumen.length === 0 ||
                   hasilPdf.length !== dokumen.length ||
                   sumberHarga === "memuat" ||
-                  sumberHarga === "demo"
+                  sumberHarga === "demo" ||
+                  (Boolean(kebijakan.trim()) && !setujuKebijakan)
                 }
                 className="w-full rounded-full bg-[#28543b] px-6 py-4 font-bold text-white transition hover:bg-[#1d402c] disabled:cursor-not-allowed disabled:bg-[#a7b5a7]"
               >
