@@ -1,14 +1,15 @@
 import { NextResponse } from "next/server";
-import { getHarga, getPaket } from "@/lib/harga";
+import { getHarga, getKebijakan, getPaket } from "@/lib/harga";
 
 export async function GET() {
   try {
-    const [harga, paket] = await Promise.all([
+    const [harga, paket, kebijakan] = await Promise.all([
       getHarga(),
       getPaket(),
+      getKebijakan(),
     ]);
 
-    return NextResponse.json({ harga, paket });
+    return NextResponse.json({ harga, paket, kebijakan: kebijakan });
   } catch (error) {
     console.error("GET /api/harga gagal:", error);
 
