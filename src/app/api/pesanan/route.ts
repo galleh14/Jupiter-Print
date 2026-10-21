@@ -4,13 +4,20 @@ import { PDFDocument } from "pdf-lib";
 import { hitungHarga, type PriceSettings } from "@/lib/pricing";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 
+export const maxDuration = 60;
+
 const MAX_FILES = 5;
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
 const MAX_TOTAL_PAGES = 10_000;
 const BUCKET = "order-files";
+const UUID_PDF_PATH = /^uploads\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.pdf$/i;
 
-type FilePdfValid = {
-  file: File;
+type FileInput = {
+  path: string;
+  nama_asli: string;
+};
+
+type ValidatedFile = FileInput & {
   halaman: number;
 };
 
@@ -18,31 +25,23 @@ function errorResponse(message: string, status = 400) {
   return NextResponse.json({ success: false, error: message }, { status });
 }
 
-function angkaBulat(
-  value: FormDataEntryValue | null,
-  nama: string,
-  minimum: number,
-  maksimum: number,
-): number {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`${nama} wajib diisi.`);
+function angkaBulat(value: unknown, nama: string, minimum: number, maksimum: number) {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < minimum ||
+    value > maksimum
+  ) {
+    throw new Error(`${nama} harus berupa bilangan bulat ${minimum}–${maksimum}.`);
   }
-
-  const number = Number(value);
-
-  if (!Number.isSafeInteger(number) || number < minimum || number > maksimum) {
-    throw new Error(
-      `${nama} harus berupa bilangan bulat ${minimum}–${maksimum}.`,
-    );
-  }
-
-  return number;
+  return value;
 }
 
-function booleanForm(value: FormDataEntryValue | null, nama: string): boolean {
-  if (value === "true") return true;
-  if (value === "false") return false;
-  throw new Error(`${nama} tidak valid.`);
+function booleanJson(value: unknown, nama: string) {
+  if (typeof value !== "boolean") {
+    throw new Error(`${nama} tidak valid.`);
+  }
+  return value;
 }
 
 function buatKodeOrder(): string {
@@ -50,153 +49,183 @@ function buatKodeOrder(): string {
     .toISOString()
     .replace(/[-:TZ.]/g, "")
     .slice(2, 12);
-
-  const acak = randomBytes(3).toString("hex").toUpperCase();
-  return `JP-${waktu}-${acak}`;
+  return `JP-${waktu}-${randomBytes(3).toString("hex").toUpperCase()}`;
 }
 
-async function bacaDanHitungPdf(file: File): Promise<FilePdfValid> {
-  if (!file.name.toLowerCase().endsWith(".pdf")) {
-    throw new Error(`${file.name}: hanya file PDF yang diperbolehkan.`);
+async function bacaDanHitungPdf(
+  supabase: ReturnType<typeof supabaseAdmin>,
+  file: FileInput,
+): Promise<ValidatedFile> {
+  const { data, error } = await supabase.storage.from(BUCKET).download(file.path);
+
+  if (error || !data) {
+    throw new Error(`${file.nama_asli}: file tidak dapat dibaca dari storage.`);
   }
 
-  if (file.size <= 0 || file.size > MAX_FILE_SIZE) {
-    throw new Error(
-      `${file.name}: ukuran file harus lebih dari 0 dan maksimal 20 MB.`,
-    );
+  const bytes = await data.arrayBuffer();
+  if (bytes.byteLength <= 0 || bytes.byteLength > MAX_FILE_SIZE) {
+    throw new Error(`${file.nama_asli}: ukuran file maksimal 20 MB.`);
   }
 
-  const bytes = await file.arrayBuffer();
-  const awal = new TextDecoder().decode(
-    bytes.slice(0, Math.min(bytes.byteLength, 1024)),
-  );
-
-  if (!awal.includes("%PDF-")) {
-    throw new Error(`${file.name}: file tidak memiliki header PDF yang valid.`);
+  const header = new TextDecoder().decode(bytes.slice(0, 5));
+  if (header !== "%PDF-") {
+    throw new Error(`${file.nama_asli}: file tidak memiliki header PDF yang valid.`);
   }
 
   try {
-    const pdf = await PDFDocument.load(bytes, {
-      ignoreEncryption: false,
-    });
-
+    const pdf = await PDFDocument.load(bytes, { ignoreEncryption: false });
     const halaman = pdf.getPageCount();
 
     if (!Number.isSafeInteger(halaman) || halaman < 1) {
       throw new Error("PDF tidak memiliki halaman yang valid.");
     }
 
-    return { file, halaman };
+    return { ...file, halaman };
   } catch {
     throw new Error(
-      `${file.name}: PDF tidak dapat dibaca. Pastikan file tidak rusak atau terkunci kata sandi.`,
+      `${file.nama_asli}: PDF tidak dapat dibaca. Pastikan file tidak rusak atau terkunci kata sandi.`,
     );
   }
+}
+
+function dataPesananSukses(order: {
+  kode_order: string;
+  total: number;
+  jumlah_halaman: number;
+  jumlah_eksemplar: number;
+  nama: string;
+  no_wa: string;
+  paket: string | null;
+}) {
+  return {
+    success: true,
+    kodeOrder: order.kode_order,
+    total: order.total,
+    jumlahHalaman: order.jumlah_halaman,
+    jumlahEksemplar: order.jumlah_eksemplar,
+    nama: order.nama,
+    noWa: order.no_wa,
+    paket: order.paket,
+  };
 }
 
 export async function POST(request: Request) {
   const supabase = supabaseAdmin();
   let orderId: string | null = null;
-  const uploadedPaths: string[] = [];
+  let pathsToDelete: string[] = [];
 
   try {
-    const formData = await request.formData();
-    const idempotencyKeyValue = formData.get("idempotency_key");
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return errorResponse("Data pesanan tidak valid.");
+    }
 
+    if (typeof body !== "object" || body === null) {
+      return errorResponse("Data pesanan tidak valid.");
+    }
+
+    const data = body as Record<string, unknown>;
+    const idempotencyKey = data.idempotency_key;
     if (
-      typeof idempotencyKeyValue !== "string" ||
+      typeof idempotencyKey !== "string" ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        idempotencyKeyValue,
+        idempotencyKey,
       )
     ) {
       return errorResponse("Kunci pesanan tidak valid.");
     }
 
-    const idempotencyKey = idempotencyKeyValue;
-
-    const namaValue = formData.get("nama");
-    const waValue = formData.get("no_wa");
-    const ambilKirimValue = formData.get("ambil_kirim");
-
-    if (typeof namaValue !== "string" || !namaValue.trim()) {
-      return errorResponse("Nama pelanggan wajib diisi.");
+    const nama = typeof data.nama === "string" ? data.nama.trim() : "";
+    const noWa = typeof data.no_wa === "string" ? data.no_wa.trim() : "";
+    if (!nama || nama.length > 100) {
+      return errorResponse("Nama pelanggan wajib diisi dan maksimal 100 karakter.");
     }
-
-    if (typeof waValue !== "string" || !waValue.trim()) {
-      return errorResponse("Nomor WhatsApp wajib diisi.");
-    }
-
-    const nama = namaValue.trim();
-    const noWa = waValue.trim();
-
-    if (nama.length > 100) {
-      return errorResponse("Nama maksimal 100 karakter.");
-    }
-
     if (!/^[+0-9()\-\s]{8,20}$/.test(noWa)) {
       return errorResponse("Format nomor WhatsApp tidak valid.");
     }
 
-    if (ambilKirimValue !== "ambil" && ambilKirimValue !== "kirim") {
+    if (data.ambil_kirim !== "ambil" && data.ambil_kirim !== "kirim") {
       return errorResponse("Metode penerimaan pesanan tidak valid.");
     }
+    const ambilKirim: "ambil" | "kirim" =
+      data.ambil_kirim === "ambil" ? "ambil" : "kirim";
 
-    const pakaiKlip = booleanForm(formData.get("pakai_klip"), "Pilihan klip");
+    const pakaiKlip = booleanJson(data.pakai_klip, "Pilihan klip");
     const jumlahLembarKonsul = angkaBulat(
-      formData.get("jumlah_lembar_konsul"),
+      data.jumlah_lembar_konsul,
       "Jumlah lembar konsultasi",
       0,
       100,
     );
     const jumlahEksemplar = angkaBulat(
-      formData.get("jumlah_eksemplar"),
+      data.jumlah_eksemplar,
       "Jumlah eksemplar",
       1,
       100,
     );
 
-    const paketIdValue = formData.get("paket_id");
     let paketId: number | null = null;
-
-    if (paketIdValue !== null && paketIdValue !== "") {
-      if (typeof paketIdValue !== "string" || !/^\d+$/.test(paketIdValue)) {
-        return errorResponse("Pilihan paket tidak valid.");
-      }
-
-      paketId = Number(paketIdValue);
-
-      if (!Number.isSafeInteger(paketId) || paketId < 1) {
-        return errorResponse("Pilihan paket tidak valid.");
-      }
+    if (data.paket_id !== null && data.paket_id !== undefined) {
+      paketId = angkaBulat(data.paket_id, "Pilihan paket", 1, Number.MAX_SAFE_INTEGER);
     }
 
-    const files = formData
-      .getAll("dokumen")
-      .filter((item): item is File => item instanceof File && item.size > 0);
-
-    if (files.length < 1 || files.length > MAX_FILES) {
-      return errorResponse(
-        `Pilih minimal 1 dan maksimal ${MAX_FILES} file PDF.`,
-      );
+    const filesValue = data.files;
+    if (!Array.isArray(filesValue) || filesValue.length < 1 || filesValue.length > MAX_FILES) {
+      return errorResponse(`Pilih minimal 1 dan maksimal ${MAX_FILES} file PDF.`);
     }
 
-    // Validasi dan penghitungan halaman dilakukan di server.
-    const pdfValid: FilePdfValid[] = [];
+    const files: FileInput[] = filesValue.map((item) => {
+      const file = item as Record<string, unknown>;
+      if (
+        typeof item !== "object" ||
+        item === null ||
+        typeof file.path !== "string" ||
+        typeof file.nama_asli !== "string" ||
+        !file.nama_asli.trim()
+      ) {
+        throw new Error("Data file pesanan tidak valid.");
+      }
+      return { path: file.path, nama_asli: file.nama_asli.trim() };
+    });
 
+    const paths = files.map((file) => file.path);
+    if (
+      paths.some((path) => !UUID_PDF_PATH.test(path)) ||
+      new Set(paths).size !== paths.length
+    ) {
+      return errorResponse("Path file PDF tidak valid atau duplikat.");
+    }
+    pathsToDelete = paths;
+
+    const { data: existingOrder, error: existingError } = await supabase
+      .from("orders")
+      .select("kode_order, total, jumlah_halaman, jumlah_eksemplar, nama, no_wa, paket, idempotency_status")
+      .eq("idempotency_key", idempotencyKey)
+      .maybeSingle();
+
+    if (existingError) {
+      console.error("Gagal memeriksa idempotency:", existingError.message);
+      return errorResponse("Gagal memeriksa status pesanan.", 500);
+    }
+    if (existingOrder) {
+      if (existingOrder.idempotency_status === "completed") {
+        return NextResponse.json(dataPesananSukses(existingOrder));
+      }
+      return errorResponse("Pesanan dengan permintaan ini sedang diproses.", 409);
+    }
+
+    const pdfValid: ValidatedFile[] = [];
     for (const file of files) {
-      pdfValid.push(await bacaDanHitungPdf(file));
+      pdfValid.push(await bacaDanHitungPdf(supabase, file));
     }
 
-    const jumlahHalaman = pdfValid.reduce(
-      (total, item) => total + item.halaman,
-      0,
-    );
-
+    const jumlahHalaman = pdfValid.reduce((total, file) => total + file.halaman, 0);
     if (jumlahHalaman > MAX_TOTAL_PAGES) {
-      return errorResponse("Total halaman semua PDF maksimal 10.000.");
+      throw new Error("Total halaman semua PDF maksimal 10.000.");
     }
 
-    // Ambil harga terbaru dari database, bukan dari browser.
     const { data: dataHarga, error: errorHarga } = await supabase
       .from("price_settings")
       .select("harga_cetak, harga_klip, harga_konsul")
@@ -206,14 +235,10 @@ export async function POST(request: Request) {
 
     if (errorHarga) {
       console.error("Gagal mengambil harga:", errorHarga.message);
-      return errorResponse(
-        "Harga belum dapat diambil. Silakan coba lagi.",
-        500,
-      );
+      throw new Error("Harga belum dapat diambil. Silakan coba lagi.");
     }
-
     if (!dataHarga) {
-      return errorResponse("Harga cetak belum diatur oleh admin.", 503);
+      throw new Error("Harga cetak belum diatur oleh admin.");
     }
 
     const harga: PriceSettings = {
@@ -221,7 +246,6 @@ export async function POST(request: Request) {
       hargaKlip: Number(dataHarga.harga_klip),
       hargaKonsul: Number(dataHarga.harga_konsul),
     };
-
     if (
       !Number.isSafeInteger(harga.hargaCetak) ||
       !Number.isSafeInteger(harga.hargaKlip) ||
@@ -230,13 +254,12 @@ export async function POST(request: Request) {
       harga.hargaKlip < 0 ||
       harga.hargaKonsul < 0
     ) {
-      return errorResponse("Konfigurasi harga di database tidak valid.", 500);
+      throw new Error("Konfigurasi harga di database tidak valid.");
     }
 
     let namaPaket: string | null = null;
-
     if (paketId !== null) {
-      const { data: dataPaket, error: errorPaket } = await supabase
+      const { data: paket, error: errorPaket } = await supabase
         .from("packages")
         .select("id, nama, aktif")
         .eq("id", paketId)
@@ -245,38 +268,25 @@ export async function POST(request: Request) {
 
       if (errorPaket) {
         console.error("Gagal memeriksa paket:", errorPaket.message);
-        return errorResponse(
-          "Paket tidak dapat diperiksa. Silakan coba lagi.",
-          500,
-        );
+        throw new Error("Paket tidak dapat diperiksa. Silakan coba lagi.");
       }
-
-      if (!dataPaket) {
-        return errorResponse("Paket tidak ditemukan atau sudah tidak aktif.");
+      if (!paket) {
+        throw new Error("Paket tidak ditemukan atau sudah tidak aktif.");
       }
-
-      namaPaket = dataPaket.nama;
+      namaPaket = paket.nama;
     }
 
     const hasil = hitungHarga(
-      {
-        jumlahHalaman,
-        pakaiKlip,
-        jumlahLembarKonsul,
-        jumlahEksemplar,
-      },
+      { jumlahHalaman, pakaiKlip, jumlahLembarKonsul, jumlahEksemplar },
       harga,
     );
-
-    const kodeOrder = buatKodeOrder();
 
     const { data: dataOrder, error: errorOrder } = await supabase
       .from("orders")
       .insert({
         idempotency_key: idempotencyKey,
         idempotency_status: "processing",
-
-        kode_order: kodeOrder,
+        kode_order: buatKodeOrder(),
         nama,
         no_wa: noWa,
         paket: namaPaket,
@@ -288,7 +298,7 @@ export async function POST(request: Request) {
         harga_klip_saat_order: harga.hargaKlip,
         harga_konsul_saat_order: harga.hargaKonsul,
         total: hasil.total,
-        ambil_kirim: ambilKirimValue,
+        ambil_kirim: ambilKirim,
         status: "menunggu_pembayaran",
         status_bayar: "belum",
       })
@@ -296,115 +306,55 @@ export async function POST(request: Request) {
       .single();
 
     if (errorOrder || !dataOrder) {
-      // 23505 = unique_violation; key ini mungkin sudah dipakai request sebelumnya.
       if (errorOrder?.code === "23505") {
-        const { data: pesananLama, error: errorPesananLama } = await supabase
+        const { data: duplicate } = await supabase
           .from("orders")
-          .select("kode_order, total, idempotency_status")
+          .select("kode_order, total, jumlah_halaman, jumlah_eksemplar, nama, no_wa, paket, idempotency_status")
           .eq("idempotency_key", idempotencyKey)
           .maybeSingle();
-
-        if (errorPesananLama) {
-          console.error(
-            "Gagal memeriksa pesanan duplikat:",
-            errorPesananLama.message,
-          );
-          return errorResponse("Gagal memeriksa status pesanan.", 500);
+        if (duplicate?.idempotency_status === "completed") {
+          return NextResponse.json(dataPesananSukses(duplicate));
         }
-
-        if (pesananLama?.idempotency_status === "completed") {
-          return errorResponse(
-            "Pesanan dengan kunci ini sudah selesai diproses. Jangan kirim ulang pesanan.",
-            409,
-          );
-        }
-
-        return errorResponse(
-          "Pesanan dengan permintaan ini sedang diproses. Periksa status pesanan sebelum mencoba lagi.",
-          409,
-        );
+        return errorResponse("Pesanan dengan permintaan ini sedang diproses.", 409);
       }
-
       console.error("Gagal menyimpan pesanan:", errorOrder?.message);
-      return errorResponse("Pesanan gagal disimpan. Silakan coba lagi.", 500);
+      throw new Error("Pesanan gagal disimpan. Silakan coba lagi.");
     }
 
     orderId = dataOrder.id;
 
-    // Unggah setiap PDF ke bucket privat dan simpan jumlah halamannya.
-    const barisFile: {
-      order_id: string;
-      nama_asli: string;
-      path_storage: string;
-      halaman_sistem: number;
-    }[] = [];
-
-    for (let index = 0; index < pdfValid.length; index++) {
-      const item = pdfValid[index];
-      const ekstensiAman = `${randomBytes(12).toString("hex")}.pdf`;
-      const pathStorage = `${dataOrder.id}/${index + 1}-${ekstensiAman}`;
-
-      const { error: errorUpload } = await supabase.storage
-        .from(BUCKET)
-        .upload(pathStorage, item.file, {
-          contentType: "application/pdf",
-          upsert: false,
-        });
-
-      if (errorUpload) {
-        console.error("Gagal mengunggah PDF:", errorUpload.message);
-        throw new Error("File PDF gagal disimpan. Silakan coba lagi.");
-      }
-
-      uploadedPaths.push(pathStorage);
-
-      barisFile.push({
-        order_id: dataOrder.id,
-        nama_asli: item.file.name,
-        path_storage: pathStorage,
-        halaman_sistem: item.halaman,
-      });
-    }
-
-    const { error: errorSimpanFile } = await supabase
-      .from("order_files")
-      .insert(barisFile);
-
+    const { error: errorSimpanFile } = await supabase.from("order_files").insert(
+      pdfValid.map((file) => ({
+        order_id: orderId,
+        nama_asli: file.nama_asli,
+        path_storage: file.path,
+        halaman_sistem: file.halaman,
+      })),
+    );
     if (errorSimpanFile) {
       console.error("Gagal menyimpan metadata file:", errorSimpanFile.message);
       throw new Error("Data file pesanan gagal disimpan. Silakan coba lagi.");
     }
 
-    const { error: errorLog } = await supabase
-      .from("order_status_logs")
-      .insert({
-        order_id: dataOrder.id,
-        status_lama: null,
-        status_baru: "menunggu_pembayaran",
-        oleh: "sistem",
-        catatan: "Pesanan dibuat dan menunggu pembayaran.",
-      });
+    const { error: errorLog } = await supabase.from("order_status_logs").insert({
+      order_id: orderId,
+      status_lama: null,
+      status_baru: "menunggu_pembayaran",
+      oleh: "sistem",
+      catatan: "Pesanan dibuat dan menunggu pembayaran.",
+    });
+    if (errorLog) {
+      console.error("Gagal mencatat log status:", errorLog.message);
+    }
 
-    // Tandai idempotency selesai setelah file dan metadata berhasil disimpan.
     const { error: errorUpdateStatus } = await supabase
       .from("orders")
       .update({ idempotency_status: "completed" })
-      .eq("id", dataOrder.id)
+      .eq("id", orderId)
       .eq("idempotency_key", idempotencyKey);
-
     if (errorUpdateStatus) {
-      console.error(
-        "Gagal memperbarui status idempotency:",
-        errorUpdateStatus.message,
-      );
-      throw new Error(
-        "Pesanan tersimpan, tetapi status pemrosesan gagal diperbarui.",
-      );
-    }
-
-    if (errorLog) {
-      // Pesanan tetap valid walau pencatatan log gagal.
-      console.error("Gagal mencatat log status:", errorLog.message);
+      console.error("Gagal memperbarui status idempotency:", errorUpdateStatus.message);
+      throw new Error("Pesanan tersimpan, tetapi status pemrosesan gagal diperbarui.");
     }
 
     return NextResponse.json({
@@ -420,12 +370,10 @@ export async function POST(request: Request) {
   } catch (error) {
     console.error("Kesalahan saat membuat pesanan:", error);
 
-    // Upayakan membersihkan file dan data pesanan bila proses belum selesai.
-    if (uploadedPaths.length > 0) {
+    if (pathsToDelete.length > 0) {
       const { error: errorHapusStorage } = await supabase.storage
         .from(BUCKET)
-        .remove(uploadedPaths);
-
+        .remove(pathsToDelete);
       if (errorHapusStorage) {
         console.error("Gagal membersihkan file:", errorHapusStorage.message);
       }
@@ -436,38 +384,24 @@ export async function POST(request: Request) {
         .from("order_status_logs")
         .delete()
         .eq("order_id", orderId);
-
-      if (errorHapusLog) {
-        console.error("Gagal membersihkan log status:", errorHapusLog.message);
-      }
+      if (errorHapusLog) console.error("Gagal membersihkan log:", errorHapusLog.message);
 
       const { error: errorHapusMetadata } = await supabase
         .from("order_files")
         .delete()
         .eq("order_id", orderId);
-
-      if (errorHapusMetadata) {
-        console.error(
-          "Gagal membersihkan metadata file:",
-          errorHapusMetadata.message,
-        );
-      }
+      if (errorHapusMetadata) console.error("Gagal membersihkan metadata file:", errorHapusMetadata.message);
 
       const { error: errorHapusOrder } = await supabase
         .from("orders")
         .delete()
         .eq("id", orderId);
-
-      if (errorHapusOrder) {
-        console.error("Gagal membersihkan pesanan:", errorHapusOrder.message);
-      }
+      if (errorHapusOrder) console.error("Gagal membersihkan pesanan:", errorHapusOrder.message);
     }
 
-    const message =
-      error instanceof Error
-        ? error.message
-        : "Terjadi kesalahan saat membuat pesanan.";
-
-    return errorResponse(message, 400);
+    return errorResponse(
+      error instanceof Error ? error.message : "Terjadi kesalahan saat membuat pesanan.",
+      400,
+    );
   }
 }
