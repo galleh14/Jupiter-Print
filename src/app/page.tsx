@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { hitungHarga, type PriceSettings } from "@/lib/pricing";
 import { hitungHalamanPdf, type HasilHitungPdf } from "@/lib/pdf";
+import { supabasePublik } from "@/lib/supabase/client";
 
 type Paket = {
   id: number;
@@ -44,7 +45,7 @@ const HARGA_DEMO: PriceSettings = {
   hargaKonsul: 350,
 };
 
-const NOMOR_WA_ADMIN = "6281268321914";
+const NOMOR_WA_ADMIN = process.env.NEXT_PUBLIC_ADMIN_WA;
 const BATAS_FILE = 5;
 const BATAS_UKURAN = 20 * 1024 * 1024;
 
@@ -97,6 +98,7 @@ export default function Home() {
   const [jumlahEksemplar, setJumlahEksemplar] = useState(1);
 
   const [loading, setLoading] = useState(false);
+  const [progresUpload, setProgresUpload] = useState("");
   const idempotencyKeyRef = useRef<string | null>(null);
   const [errorPesanan, setErrorPesanan] = useState("");
   const [orderSukses, setOrderSukses] = useState<PesananBerhasil | null>(null);
@@ -282,34 +284,58 @@ export default function Home() {
     if (sedangHitung || loading) return;
 
     setLoading(true);
+    setProgresUpload("");
 
     if (!idempotencyKeyRef.current) {
       idempotencyKeyRef.current = crypto.randomUUID();
     }
 
     try {
-      const formData = new FormData();
-      formData.set("idempotency_key", idempotencyKeyRef.current!);
-      formData.set("nama", nama.trim());
-      formData.set("no_wa", noWa.trim());
-      formData.set("ambil_kirim", ambilKirim);
-      formData.set("pakai_klip", String(pakaiKlip));
-      formData.set("jumlah_lembar_konsul", String(jumlahLembarKonsul));
-      formData.set("jumlah_eksemplar", String(jumlahEksemplar));
+      const supabase = supabasePublik();
+      const files: { path: string; nama_asli: string }[] = [];
 
-      if (paketTerpilih !== null) {
-        formData.set("paket_id", String(paketTerpilih));
-      }
+      for (let index = 0; index < dokumen.length; index++) {
+        const file = dokumen[index];
+        setProgresUpload(`Mengunggah file ${index + 1} dari ${dokumen.length}`);
 
-      // Jumlah halaman dari browser sengaja tidak dikirim sebagai sumber harga.
-      // Server menghitungnya ulang dari file PDF yang diterima.
-      for (const file of dokumen) {
-        formData.append("dokumen", file);
+        const uploadUrlResponse = await fetch("/api/upload-url", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ext: "pdf" }),
+        });
+        const uploadUrlData = await uploadUrlResponse.json();
+
+        if (!uploadUrlResponse.ok || !uploadUrlData.path || !uploadUrlData.token) {
+          throw new Error(
+            uploadUrlData.error ?? "URL upload file tidak dapat dibuat.",
+          );
+        }
+
+        const { error: errorUpload } = await supabase.storage
+          .from("order-files")
+          .uploadToSignedUrl(uploadUrlData.path, uploadUrlData.token, file);
+
+        if (errorUpload) {
+          throw new Error(`${file.name}: file gagal diunggah.`);
+        }
+
+        files.push({ path: uploadUrlData.path, nama_asli: file.name });
       }
 
       const response = await fetch("/api/pesanan", {
         method: "POST",
-        body: formData,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          idempotency_key: idempotencyKeyRef.current,
+          nama: nama.trim(),
+          no_wa: noWa.trim(),
+          ambil_kirim: ambilKirim,
+          pakai_klip: pakaiKlip,
+          jumlah_lembar_konsul: jumlahLembarKonsul,
+          jumlah_eksemplar: jumlahEksemplar,
+          paket_id: paketTerpilih,
+          files,
+        }),
       });
 
       const data = await response.json();
@@ -320,6 +346,7 @@ export default function Home() {
 
       setOrderSukses(data as PesananBerhasil);
       idempotencyKeyRef.current = null;
+      setProgresUpload("");
     } catch (error) {
       setErrorPesanan(
         error instanceof Error
@@ -328,11 +355,16 @@ export default function Home() {
       );
     } finally {
       setLoading(false);
+      setProgresUpload("");
     }
   }
 
   function konfirmasiWhatsApp() {
     if (!orderSukses) return;
+    if (!NOMOR_WA_ADMIN) {
+      setErrorPesanan("Nomor WhatsApp admin belum dikonfigurasi.");
+      return;
+    }
 
     const pesan = [
       "Halo JupiterPrint, saya ingin mengonfirmasi pesanan.",
@@ -479,6 +511,12 @@ export default function Home() {
                 {sedangHitung && (
                   <p className="mt-4 text-sm font-semibold text-[#718b5c]">
                     Sedang membaca PDF dan menghitung halaman...
+                  </p>
+                )}
+
+                {progresUpload && (
+                  <p className="mt-4 text-sm font-semibold text-[#718b5c]">
+                    {progresUpload}
                   </p>
                 )}
 
