@@ -1,21 +1,22 @@
-import { NextResponse } from "next/server";
-import { getHarga, getKebijakan, getPaket } from "@/lib/harga";
+import { connection, NextResponse } from "next/server";
+import { getHarga, getPaket, getKebijakan } from "@/lib/harga";
 
 export async function GET() {
+  // Wajib: baca database tiap request, jangan dibekukan saat build.
+  await connection();
+
   try {
     const [harga, paket, kebijakan] = await Promise.all([
       getHarga(),
       getPaket(),
       getKebijakan(),
     ]);
-
-    return NextResponse.json({ harga, paket, kebijakan: kebijakan });
-  } catch (error) {
-    console.error("GET /api/harga gagal:", error);
-
     return NextResponse.json(
-      { error: "Gagal mengambil data harga dan paket" },
-      { status: 500 }
+      { harga, paket, kebijakan },
+      { headers: { "Cache-Control": "no-store" } }
     );
+  } catch (e) {
+    console.error("Gagal memuat harga:", e);
+    return NextResponse.json({ error: "Harga belum bisa dimuat." }, { status: 500 });
   }
 }

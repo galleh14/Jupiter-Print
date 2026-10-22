@@ -1,6 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import { hitungHarga, type PriceSettings } from "@/lib/pricing";
 import { hitungHalamanPdf, type HasilHitungPdf } from "@/lib/pdf";
 import { supabasePublik } from "@/lib/supabase/client";
@@ -101,6 +108,7 @@ export default function Home() {
   const [jumlahEksemplar, setJumlahEksemplar] = useState(1);
 
   const [loading, setLoading] = useState(false);
+  const [sedangMuatHarga, setSedangMuatHarga] = useState(false);
   const [progresUpload, setProgresUpload] = useState("");
   const idempotencyKeyRef = useRef<string | null>(null);
   const [errorPesanan, setErrorPesanan] = useState("");
@@ -134,10 +142,11 @@ export default function Home() {
     }
   }, [jumlahHalaman, pakaiKlip, jumlahLembarKonsul, jumlahEksemplar, harga]);
 
-  useEffect(() => {
-    let aktif = true;
+  const muatHarga = useCallback(async () => {
+    setSedangMuatHarga(true);
+    setSumberHarga("memuat");
 
-    async function muatHarga() {
+    for (let percobaan = 0; percobaan < 3; percobaan++) {
       try {
         const response = await fetch("/api/harga", { cache: "no-store" });
 
@@ -168,14 +177,12 @@ export default function Home() {
         const paket = Array.isArray(data.paket)
           ? data.paket.map((item) =>
               normalisasiPaket(item as Record<string, unknown>),
-            )
-          : [];
-
-        if (!aktif) return;
+                )
+              : [];
 
         setHarga({
-          hargaCetak,
-          hargaKlip,
+              hargaCetak,
+              hargaKlip,
           hargaKonsul,
         });
         setPaketList(paket);
@@ -190,18 +197,27 @@ export default function Home() {
           setJumlahLembarKonsul(pertama.lembarKonsulDefault);
           setJumlahEksemplar(pertama.jumlahEksemplarDefault);
         }
+
+        setSedangMuatHarga(false);
+        return;
       } catch {
-        if (!aktif) return;
-        setSumberHarga("demo");
+        if (percobaan < 2) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
       }
     }
 
-    void muatHarga();
-
-    return () => {
-      aktif = false;
-    };
+    setSumberHarga("demo");
+    setSedangMuatHarga(false);
   }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void muatHarga();
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [muatHarga]);
 
   async function pilihDokumen(files: FileList | null) {
     setErrorPesanan("");
@@ -802,11 +818,21 @@ export default function Home() {
                     : "Buat Pesanan"}
               </button>
 
-              {sumberHarga === "demo" && (
-                <p className="text-sm text-amber-700">
-                  Harga database belum berhasil dimuat. Pengiriman pesanan
-                  dinonaktifkan agar tidak menggunakan harga demo.
-                </p>
+              {(sumberHarga === "demo" || sedangMuatHarga) && (
+                <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-amber-700">
+                  <p>
+                    Harga database belum berhasil dimuat. Pengiriman pesanan
+                    dinonaktifkan agar tidak menggunakan harga demo.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void muatHarga()}
+                    disabled={sedangMuatHarga}
+                    className="rounded-full border border-amber-300 px-4 py-2 font-semibold transition hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {sedangMuatHarga ? "Memuat harga..." : "Coba lagi"}
+                  </button>
+                </div>
               )}
             </form>
 
